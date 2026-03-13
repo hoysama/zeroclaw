@@ -8,6 +8,10 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
+  ProviderListItem,
+  ProviderModelCatalog,
+  ProviderModelConfig,
+  ProviderModelUpdate,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 
@@ -134,6 +138,37 @@ export function putConfig(toml: string): Promise<void> {
     headers: { 'Content-Type': 'application/toml' },
     body: toml,
   });
+}
+
+export function getProviderModelConfig(): Promise<ProviderModelConfig> {
+  return apiFetch<ProviderModelConfig>('/api/config/provider-model');
+}
+
+export function putProviderModelConfig(update: ProviderModelUpdate): Promise<void> {
+  return apiFetch<void>('/api/config/provider-model', {
+    method: 'PUT',
+    body: JSON.stringify(update),
+  });
+}
+
+export function getProviders(): Promise<ProviderListItem[]> {
+  return apiFetch<ProviderListItem[] | { providers: ProviderListItem[] }>('/api/providers').then(
+    (data) => unwrapField(data, 'providers'),
+  );
+}
+
+export function getProviderModels(provider: string): Promise<ProviderModelCatalog> {
+  const query = encodeURIComponent(provider);
+  return apiFetch<ProviderModelCatalog>(`/api/models?provider=${query}`);
+}
+
+export async function adminShutdown(): Promise<{ success: boolean; message: string }> {
+  const response = await fetch('/admin/shutdown', { method: 'POST' });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Shutdown failed (${response.status}): ${text || response.statusText}`);
+  }
+  return response.json() as Promise<{ success: boolean; message: string }>;
 }
 
 // ---------------------------------------------------------------------------

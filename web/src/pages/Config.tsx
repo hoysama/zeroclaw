@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Settings,
   Save,
@@ -6,7 +6,19 @@ import {
   AlertTriangle,
   ShieldAlert,
 } from 'lucide-react';
-import { getConfig, putConfig } from '@/lib/api';
+import {
+  getConfig,
+  putConfig,
+  getProviders,
+  getProviderModels,
+  getProviderModelConfig,
+  putProviderModelConfig,
+} from '@/lib/api';
+import type {
+  ProviderListItem,
+  ProviderModelCatalog,
+  ProviderModelOption,
+} from '@/types/api';
 
 export default function Config() {
   const [config, setConfig] = useState('');
@@ -14,15 +26,134 @@ export default function Config() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [providers, setProviders] = useState<ProviderListItem[]>([]);
+  const [modelOptions, setModelOptions] = useState<ProviderModelOption[]>([]);
+  const [modelCatalog, setModelCatalog] = useState<ProviderModelCatalog | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState('');
+  const [selectedModel, setSelectedModel] = useState('');
+  const [providerSaving, setProviderSaving] = useState(false);
+  const [providerError, setProviderError] = useState<string | null>(null);
+  const [providerSuccess, setProviderSuccess] = useState<string | null>(null);
+  const [initialProvider, setInitialProvider] = useState('');
+  const [initialModel, setInitialModel] = useState('');
+  const [loadingModels, setLoadingModels] = useState(false);
+  const modelRequestRef = useRef(0);
+
+  const formatAge = (ageSecs: number | null | undefined): string | null => {
+    if (ageSecs === null || ageSecs === undefined) return null;
+    if (ageSecs < 60) return `${ageSecs}s`;
+    if (ageSecs < 60 * 60) return `${Math.round(ageSecs / 60)}m`;
+    return `${Math.round(ageSecs / (60 * 60))}h`;
+  };
+
+  const ensureProviderOption = (
+    items: ProviderListItem[],
+    current: string,
+  ): ProviderListItem[] => {
+    if (!current) return items;
+    if (items.some((item) => item.id === current)) return items;
+    return [
+      {
+        id: current,
+        label: `${current} (current)`,
+        local: false,
+        kind: 'custom',
+      },
+      ...items,
+    ];
+  };
+
+  const ensureModelOption = (
+    items: ProviderModelOption[],
+    current: string,
+  ): ProviderModelOption[] => {
+    if (!current) return items;
+    if (items.some((item) => item.id === current)) return items;
+    return [
+      {
+        id: current,
+        label: `${current} (current)`,
+        source: 'current',
+      },
+      ...items,
+    ];
+  };
+
+  const loadModels = async (
+    providerId: string,
+    preferredModel?: string | null,
+    seedInitial = false,
+  ) => {
+    const requestId = modelRequestRef.current + 1;
+    modelRequestRef.current = requestId;
+    setLoadingModels(true);
+    setProviderError(null);
+    try {
+      const catalog = await getProviderModels(providerId);
+      if (modelRequestRef.current !== requestId) return;
+      const candidate =
+        preferredModel && preferredModel.trim().length > 0
+          ? preferredModel.trim()
+          : catalog.default_model;
+      const nextModel = candidate.trim();
+      const nextOptions = ensureModelOption(catalog.models, nextModel);
+
+      setModelCatalog(catalog);
+      setModelOptions(nextOptions);
+      setSelectedModel(nextModel);
+
+      if (seedInitial) {
+        setInitialProvider(providerId);
+        setInitialModel(nextModel);
+      }
+    } catch (err: unknown) {
+      if (modelRequestRef.current !== requestId) return;
+      setProviderError(err instanceof Error ? err.message : 'Failed to load models');
+      setModelCatalog(null);
+      setModelOptions([]);
+    } finally {
+      if (modelRequestRef.current === requestId) {
+        setLoadingModels(false);
+      }
+    }
+  };
 
   useEffect(() => {
-    getConfig()
-      .then((data) => {
-        // The API may return either a raw string or a JSON string
-        setConfig(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
-      })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+    let cancelled = false;
+
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const [configText, providerList, providerConfig] = await Promise.all([
+          getConfig(),
+          getProviders(),
+          getProviderModelConfig(),
+        ]);
+        if (cancelled) return;
+        setConfig(configText);
+
+        const defaultProvider = providerConfig.default_provider || 'openrouter';
+        const mergedProviders = ensureProviderOption(providerList, defaultProvider);
+
+        setProviders(mergedProviders);
+        setSelectedProvider(defaultProvider);
+        await loadModels(defaultProvider, providerConfig.default_model, true);
+      } catch (err: unknown) {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : 'Failed to load configuration');
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+      modelRequestRef.current += 1;
+    };
   }, []);
 
   const handleSave = async () => {
@@ -39,12 +170,82 @@ export default function Config() {
     }
   };
 
+  const handleProviderSave = async () => {
+    if (!selectedProvider.trim() || !selectedModel.trim()) return;
+    setProviderSaving(true);
+    setProviderError(null);
+    setProviderSuccess(null);
+    try {
+      await putProviderModelConfig({
+        provider: selectedProvider.trim(),
+        model: selectedModel.trim(),
+      });
+      setProviderSuccess('Provider and model saved. Restart the gateway to apply.');
+      setInitialProvider(selectedProvider.trim());
+      setInitialModel(selectedModel.trim());
+      const updatedConfig = await getConfig();
+      setConfig(updatedConfig);
+    } catch (err: unknown) {
+      setProviderError(err instanceof Error ? err.message : 'Failed to save provider/model');
+    } finally {
+      setProviderSaving(false);
+    }
+  };
+
+  const handleProviderChange = async (nextProvider: string) => {
+    setSelectedProvider(nextProvider);
+    setSelectedModel('');
+    setModelOptions([]);
+    setModelCatalog(null);
+    setProviderSuccess(null);
+    setProviderError(null);
+    await loadModels(nextProvider, null);
+  };
+
+  const handleModelSelect = (nextModel: string) => {
+    setSelectedModel(nextModel);
+    setProviderSuccess(null);
+    setProviderError(null);
+  };
+
+  const handleModelInput = (nextModel: string) => {
+    setSelectedModel(nextModel);
+    setProviderSuccess(null);
+    setProviderError(null);
+  };
+
   // Auto-dismiss success after 4 seconds
   useEffect(() => {
     if (!success) return;
     const timer = setTimeout(() => setSuccess(null), 4000);
     return () => clearTimeout(timer);
   }, [success]);
+
+  useEffect(() => {
+    if (!providerSuccess) return;
+    const timer = setTimeout(() => setProviderSuccess(null), 4000);
+    return () => clearTimeout(timer);
+  }, [providerSuccess]);
+
+  const providerDirty =
+    selectedProvider.trim().length > 0 &&
+    selectedModel.trim().length > 0 &&
+    (selectedProvider.trim() !== initialProvider ||
+      selectedModel.trim() !== initialModel);
+  const renderedModelOptions = ensureModelOption(
+    modelOptions,
+    selectedModel.trim(),
+  );
+  const modelAgeLabel = formatAge(modelCatalog?.source_age_secs);
+  const modelSourceLabel = modelCatalog
+    ? `${modelCatalog.source}${modelAgeLabel ? ` • ${modelAgeLabel} ago` : ''}`
+    : null;
+  const resolvedProviderLabel =
+    modelCatalog &&
+    modelCatalog.effective_provider &&
+    modelCatalog.effective_provider !== modelCatalog.requested_provider
+      ? modelCatalog.effective_provider
+      : null;
 
   if (loading) {
     return (
@@ -70,6 +271,107 @@ export default function Config() {
           <Save className="h-4 w-4" />
           {saving ? 'Saving...' : 'Save'}
         </button>
+      </div>
+
+      {/* Provider & Model */}
+      <div className="bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-white">Provider & Model</h3>
+            <p className="text-xs text-gray-400 mt-1">
+              Select the default provider and model. Changes update config only.
+            </p>
+          </div>
+          <button
+            onClick={handleProviderSave}
+            disabled={!providerDirty || providerSaving}
+            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
+          >
+            <Save className="h-4 w-4" />
+            {providerSaving ? 'Saving...' : 'Save Selection'}
+          </button>
+        </div>
+
+        {providerSuccess && (
+          <div className="flex items-center gap-2 bg-green-900/30 border border-green-700 rounded-lg p-3">
+            <CheckCircle className="h-4 w-4 text-green-400 flex-shrink-0" />
+            <span className="text-sm text-green-300">{providerSuccess}</span>
+          </div>
+        )}
+
+        {providerError && (
+          <div className="flex items-center gap-2 bg-red-900/30 border border-red-700 rounded-lg p-3">
+            <AlertTriangle className="h-4 w-4 text-red-400 flex-shrink-0" />
+            <span className="text-sm text-red-300">{providerError}</span>
+          </div>
+        )}
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-1">
+              Provider
+            </label>
+            <select
+              value={selectedProvider}
+              onChange={(e) => handleProviderChange(e.target.value)}
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {providers.length === 0 && (
+                <option value="">No providers available</option>
+              )}
+              {providers.map((provider) => (
+                <option key={provider.id} value={provider.id}>
+                  {provider.label}
+                </option>
+              ))}
+            </select>
+            {resolvedProviderLabel && (
+              <p className="text-xs text-gray-500 mt-2">
+                Resolved provider: {resolvedProviderLabel}
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-1">
+              Model
+            </label>
+            <select
+              value={selectedModel}
+              onChange={(e) => handleModelSelect(e.target.value)}
+              disabled={loadingModels}
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+            >
+              {loadingModels && <option value="">Loading models...</option>}
+              {!loadingModels && renderedModelOptions.length === 0 && (
+                <option value="">No models available</option>
+              )}
+              {!loadingModels &&
+                renderedModelOptions.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label}
+                  </option>
+                ))}
+            </select>
+            <input
+              type="text"
+              value={selectedModel}
+              onChange={(e) => handleModelInput(e.target.value)}
+              placeholder="Or enter a custom model id"
+              className="mt-2 w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            {modelSourceLabel && (
+              <p className="text-xs text-gray-500 mt-2">
+                Models source: {modelSourceLabel}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <p className="text-xs text-gray-500">
+          Restart the gateway after saving to apply changes to the running
+          runtime.
+        </p>
       </div>
 
       {/* Sensitive fields note */}

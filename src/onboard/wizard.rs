@@ -20,10 +20,11 @@ use crate::providers::{
 };
 use anyhow::{bail, Context, Result};
 use console::style;
+use directories::UserDirs;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -62,6 +63,328 @@ const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
+
+#[derive(Debug, Clone)]
+pub struct ProviderResolutionContext {
+    pub requested_provider: String,
+    pub effective_provider: String,
+    pub api_url: Option<String>,
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelOption {
+    pub id: String,
+    pub label: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelCatalog {
+    pub requested_provider: String,
+    pub effective_provider: String,
+    pub default_model: String,
+    pub source: String,
+    pub source_age_secs: Option<u64>,
+    pub supports_live_fetch: bool,
+    pub models: Vec<ProviderModelOption>,
+}
+
+fn normalize_wire_api(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "responses" | "openai-responses" | "open-ai-responses" => Some("responses"),
+        "chat_completions"
+        | "chat-completions"
+        | "chat"
+        | "chatcompletions"
+        | "openai-chat-completions"
+        | "open-ai-chat-completions" => Some("chat_completions"),
+        _ => None,
+    }
+}
+
+fn read_codex_openai_api_key() -> Option<String> {
+    let home = UserDirs::new()?.home_dir().to_path_buf();
+    let auth_path = home.join(".codex").join("auth.json");
+    let raw = std::fs::read_to_string(auth_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+
+    parsed
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn lookup_model_provider_profile(
+    config: &Config,
+    provider_name: &str,
+) -> Option<(String, crate::config::schema::ModelProviderConfig)> {
+    let needle = provider_name.trim();
+    if needle.is_empty() {
+        return None;
+    }
+
+    config
+        .model_providers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(needle))
+        .map(|(name, profile)| (name.clone(), profile.clone()))
+}
+
+pub fn recommended_default_model_for_provider(provider_name: &str) -> String {
+    default_model_for_provider(provider_name)
+}
+
+pub fn resolve_provider_selection_context(
+    config: &Config,
+    provider_name: &str,
+) -> Result<ProviderResolutionContext> {
+    let requested_provider = provider_name.trim();
+    if requested_provider.is_empty() {
+        bail!("Provider name cannot be empty");
+    }
+
+    let mut effective_provider = requested_provider.to_string();
+    let mut api_url = config
+        .api_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let mut api_key = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if let Some((profile_key, profile)) = lookup_model_provider_profile(config, requested_provider) {
+        let base_url = profile
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        if api_url.is_none() {
+            api_url = base_url.clone();
+        }
+
+        if profile.requires_openai_auth && api_key.is_none() {
+            api_key = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(read_codex_openai_api_key);
+        }
+
+        let normalized_wire_api = profile.wire_api.as_deref().and_then(normalize_wire_api);
+        let profile_name = profile
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if normalized_wire_api == Some("responses") {
+            effective_provider = "openai-codex".to_string();
+        } else if let Some(profile_name) = profile_name {
+            if !profile_name.eq_ignore_ascii_case(&profile_key) {
+                effective_provider = profile_name.to_string();
+            } else if let Some(base_url) = base_url {
+                effective_provider = format!("custom:{base_url}");
+            }
+        } else if let Some(base_url) = base_url {
+            effective_provider = format!("custom:{base_url}");
+        }
+    }
+
+    Ok(ProviderResolutionContext {
+        requested_provider: requested_provider.to_string(),
+        effective_provider,
+        api_url,
+        api_key,
+    })
+}
+
+fn dedupe_model_options(options: Vec<ProviderModelOption>) -> Vec<ProviderModelOption> {
+    let mut seen = BTreeSet::new();
+    options
+        .into_iter()
+        .filter(|option| seen.insert(option.id.trim().to_ascii_lowercase()))
+        .collect()
+}
+
+fn ensure_model_option(
+    options: &mut Vec<ProviderModelOption>,
+    model_id: &str,
+    label: String,
+    source: &str,
+) {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return;
+    }
+
+    if options
+        .iter()
+        .any(|option| option.id.eq_ignore_ascii_case(model_id))
+    {
+        return;
+    }
+
+    options.insert(
+        0,
+        ProviderModelOption {
+            id: model_id.to_string(),
+            label,
+            source: source.to_string(),
+        },
+    );
+}
+
+pub async fn get_provider_model_catalog(
+    config: &Config,
+    provider_name: &str,
+) -> Result<ProviderModelCatalog> {
+    let context = resolve_provider_selection_context(config, provider_name)?;
+    let default_model = default_model_for_provider(&context.effective_provider);
+    let supports_live_fetch = supports_live_model_fetch(&context.effective_provider);
+
+    let mut source = "curated".to_string();
+    let mut source_age_secs = None;
+    let mut models: Vec<ProviderModelOption> = curated_models_for_provider(&context.effective_provider)
+        .into_iter()
+        .map(|(id, label)| ProviderModelOption {
+            id,
+            label,
+            source: "curated".to_string(),
+        })
+        .collect();
+
+    if supports_live_fetch {
+        let canonical_provider = canonical_provider_name(&context.effective_provider);
+        let ollama_remote = canonical_provider == "ollama"
+            && ollama_uses_remote_endpoint(context.api_url.as_deref());
+        let can_fetch_without_key =
+            allows_unauthenticated_model_fetch(&context.effective_provider) && !ollama_remote;
+        let has_api_key = context
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || ((canonical_provider != "ollama" || ollama_remote)
+                && std::env::var(provider_env_var(&context.effective_provider))
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty()))
+            || (canonical_provider == "minimax"
+                && std::env::var("MINIMAX_OAUTH_TOKEN")
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty()));
+
+        if can_fetch_without_key || has_api_key {
+            if let Some(cached) = load_cached_models_for_provider(
+                &config.workspace_dir,
+                &context.effective_provider,
+                MODEL_CACHE_TTL_SECS,
+            )
+            .await?
+            {
+                source = "cached".to_string();
+                source_age_secs = Some(cached.age_secs);
+                models = build_model_options(
+                    cached
+                        .models
+                        .into_iter()
+                        .take(LIVE_MODEL_MAX_OPTIONS)
+                        .collect(),
+                    "cached",
+                )
+                .into_iter()
+                .map(|(id, label)| ProviderModelOption {
+                    id,
+                    label,
+                    source: "cached".to_string(),
+                })
+                .collect();
+            } else {
+                match fetch_live_models_for_provider(
+                    &context.effective_provider,
+                    context.api_key.as_deref().unwrap_or(""),
+                    context.api_url.as_deref(),
+                ) {
+                    Ok(live_model_ids) if !live_model_ids.is_empty() => {
+                        cache_live_models_for_provider(
+                            &config.workspace_dir,
+                            &context.effective_provider,
+                            &live_model_ids,
+                        )
+                        .await?;
+
+                        source = "live".to_string();
+                        models = build_model_options(
+                            live_model_ids
+                                .into_iter()
+                                .take(LIVE_MODEL_MAX_OPTIONS)
+                                .collect(),
+                            "live",
+                        )
+                        .into_iter()
+                        .map(|(id, label)| ProviderModelOption {
+                            id,
+                            label,
+                            source: "live".to_string(),
+                        })
+                        .collect();
+                    }
+                    _ => {
+                        if let Some(stale) = load_any_cached_models_for_provider(
+                            &config.workspace_dir,
+                            &context.effective_provider,
+                        )
+                        .await?
+                        {
+                            source = "stale-cache".to_string();
+                            source_age_secs = Some(stale.age_secs);
+                            models = build_model_options(
+                                stale
+                                    .models
+                                    .into_iter()
+                                    .take(LIVE_MODEL_MAX_OPTIONS)
+                                    .collect(),
+                                "stale-cache",
+                            )
+                            .into_iter()
+                            .map(|(id, label)| ProviderModelOption {
+                                id,
+                                label,
+                                source: "stale-cache".to_string(),
+                            })
+                            .collect();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ensure_model_option(
+        &mut models,
+        &default_model,
+        format!("{default_model} (recommended)"),
+        "recommended",
+    );
+
+    Ok(ProviderModelCatalog {
+        requested_provider: context.requested_provider,
+        effective_provider: context.effective_provider,
+        default_model,
+        source,
+        source_age_secs,
+        supports_live_fetch,
+        models: dedupe_model_options(models),
+    })
+}
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     channels.channels_except_webhook().iter().any(|(_, ok)| *ok)

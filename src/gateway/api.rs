@@ -8,7 +8,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const MASKED_SECRET: &str = "***MASKED***";
 
@@ -64,6 +64,39 @@ pub struct CronAddBody {
     pub name: Option<String>,
     pub schedule: String,
     pub command: String,
+}
+
+#[derive(Deserialize)]
+pub struct ProviderModelsQuery {
+    pub provider: String,
+}
+
+#[derive(Deserialize)]
+pub struct ProviderModelUpdateBody {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Builtin,
+    Profile,
+}
+
+#[derive(Serialize)]
+pub struct ProviderListItem {
+    pub id: String,
+    pub label: String,
+    pub local: bool,
+    pub kind: ProviderKind,
+}
+
+#[derive(Serialize)]
+pub struct ProviderModelConfigView {
+    pub default_provider: String,
+    pub default_model: Option<String>,
+    pub effective_provider: Option<String>,
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -179,6 +212,195 @@ pub async fn handle_api_config_put(
     *state.config.lock() = new_config;
 
     Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+/// GET /api/config/provider-model — current provider/model selection
+pub async fn handle_api_config_provider_model_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let default_provider = config
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "openrouter".to_string());
+    let effective_provider = crate::onboard::resolve_provider_selection_context(
+        &config,
+        &default_provider,
+    )
+    .ok()
+    .map(|context| context.effective_provider);
+
+    Json(ProviderModelConfigView {
+        default_provider,
+        default_model: config.default_model.clone(),
+        effective_provider,
+    })
+    .into_response()
+}
+
+/// PUT /api/config/provider-model — update provider/model selection
+pub async fn handle_api_config_provider_model_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ProviderModelUpdateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let provider = body.provider.trim();
+    if provider.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Provider cannot be empty"})),
+        )
+            .into_response();
+    }
+
+    let model = body.model.trim();
+    if model.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Model cannot be empty"})),
+        )
+            .into_response();
+    }
+
+    let mut new_config = state.config.lock().clone();
+    new_config.default_provider = Some(provider.to_string());
+    new_config.default_model = Some(model.to_string());
+
+    if let Err(e) = new_config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid config: {e}")})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = new_config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    *state.config.lock() = new_config;
+
+    Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+/// GET /api/providers — list supported providers (including configured profiles)
+pub async fn handle_api_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let mut providers: Vec<ProviderListItem> = crate::providers::list_providers()
+        .into_iter()
+        .map(|provider| ProviderListItem {
+            id: provider.name.to_string(),
+            label: provider.display_name.to_string(),
+            local: provider.local,
+            kind: ProviderKind::Builtin,
+        })
+        .collect();
+
+    let mut seen: std::collections::HashSet<String> = providers
+        .iter()
+        .map(|provider| provider.id.to_ascii_lowercase())
+        .collect();
+
+    let mut profiles: Vec<ProviderListItem> = config
+        .model_providers
+        .iter()
+        .filter_map(|(profile_key, profile)| {
+            let normalized = profile_key.to_ascii_lowercase();
+            if seen.contains(&normalized) {
+                return None;
+            }
+            seen.insert(normalized);
+            Some(ProviderListItem {
+                id: profile_key.clone(),
+                label: format_provider_profile_label(profile_key, profile),
+                local: false,
+                kind: ProviderKind::Profile,
+            })
+        })
+        .collect();
+
+    profiles.sort_by(|a, b| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()));
+    providers.extend(profiles);
+
+    Json(serde_json::json!({ "providers": providers })).into_response()
+}
+
+/// GET /api/models?provider=... — list models for provider
+pub async fn handle_api_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProviderModelsQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let provider = query.provider.trim();
+    if provider.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Provider cannot be empty"})),
+        )
+            .into_response();
+    }
+
+    let config = state.config.lock().clone();
+    match crate::onboard::get_provider_model_catalog(&config, provider).await {
+        Ok(catalog) => Json(catalog).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Failed to load models: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+fn format_provider_profile_label(
+    profile_key: &str,
+    profile: &crate::config::schema::ModelProviderConfig,
+) -> String {
+    let profile_name = profile
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let base_url = profile
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(profile_name) = profile_name {
+        if profile_name.eq_ignore_ascii_case(profile_key) {
+            format!("{profile_name} (profile)")
+        } else {
+            format!("{profile_name} (profile: {profile_key})")
+        }
+    } else if let Some(base_url) = base_url {
+        format!("{profile_key} ({base_url})")
+    } else {
+        format!("{profile_key} (profile)")
+    }
 }
 
 /// GET /api/tools — list registered tool specs

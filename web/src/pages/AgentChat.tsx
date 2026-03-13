@@ -3,6 +3,18 @@ import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
+import {
+  getProviders,
+  getProviderModels,
+  getProviderModelConfig,
+  putProviderModelConfig,
+  adminShutdown,
+} from '@/lib/api';
+import type {
+  ProviderListItem,
+  ProviderModelCatalog,
+  ProviderModelOption,
+} from '@/types/api';
 
 interface ChatMessage {
   id: string;
@@ -17,12 +29,108 @@ export default function AgentChat() {
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [providers, setProviders] = useState<ProviderListItem[]>([]);
+  const [modelOptions, setModelOptions] = useState<ProviderModelOption[]>([]);
+  const [modelCatalog, setModelCatalog] = useState<ProviderModelCatalog | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState('');
+  const [selectedModel, setSelectedModel] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
+  const [modelSaving, setModelSaving] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
+  const [modelSaved, setModelSaved] = useState<string | null>(null);
+  const [initialProvider, setInitialProvider] = useState('');
+  const [initialModel, setInitialModel] = useState('');
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const [restartMessage, setRestartMessage] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
+  const modelRequestRef = useRef(0);
+
+  const formatAge = (ageSecs: number | null | undefined): string | null => {
+    if (ageSecs === null || ageSecs === undefined) return null;
+    if (ageSecs < 60) return `${ageSecs}s`;
+    if (ageSecs < 60 * 60) return `${Math.round(ageSecs / 60)}m`;
+    return `${Math.round(ageSecs / (60 * 60))}h`;
+  };
+
+  const ensureProviderOption = (
+    items: ProviderListItem[],
+    current: string,
+  ): ProviderListItem[] => {
+    if (!current) return items;
+    if (items.some((item) => item.id === current)) return items;
+    return [
+      {
+        id: current,
+        label: `${current} (current)`,
+        local: false,
+        kind: 'custom',
+      },
+      ...items,
+    ];
+  };
+
+  const ensureModelOption = (
+    items: ProviderModelOption[],
+    current: string,
+  ): ProviderModelOption[] => {
+    if (!current) return items;
+    if (items.some((item) => item.id === current)) return items;
+    return [
+      {
+        id: current,
+        label: `${current} (current)`,
+        source: 'current',
+      },
+      ...items,
+    ];
+  };
+
+  const loadModels = async (
+    providerId: string,
+    preferredModel?: string | null,
+    seedInitial = false,
+  ) => {
+    const requestId = modelRequestRef.current + 1;
+    modelRequestRef.current = requestId;
+    setLoadingModels(true);
+    setModelError(null);
+    try {
+      const catalog = await getProviderModels(providerId);
+      if (modelRequestRef.current !== requestId) return;
+      const candidate =
+        preferredModel && preferredModel.trim().length > 0
+          ? preferredModel.trim()
+          : catalog.default_model;
+      const nextModel = candidate.trim();
+      const nextOptions = ensureModelOption(catalog.models, nextModel);
+
+      setModelCatalog(catalog);
+      setModelOptions(nextOptions);
+      setSelectedModel(nextModel);
+      setModelSearch('');
+
+      if (seedInitial) {
+        setInitialProvider(providerId);
+        setInitialModel(nextModel);
+      }
+    } catch (err: unknown) {
+      if (modelRequestRef.current !== requestId) return;
+      setModelError(err instanceof Error ? err.message : 'Failed to load models');
+      setModelCatalog(null);
+      setModelOptions([]);
+    } finally {
+      if (modelRequestRef.current === requestId) {
+        setLoadingModels(false);
+      }
+    }
+  };
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -115,6 +223,33 @@ export default function AgentChat() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      try {
+        const [providerList, providerConfig] = await Promise.all([
+          getProviders(),
+          getProviderModelConfig(),
+        ]);
+        if (cancelled) return;
+        const defaultProvider = providerConfig.default_provider || 'openrouter';
+        setProviders(ensureProviderOption(providerList, defaultProvider));
+        setSelectedProvider(defaultProvider);
+        await loadModels(defaultProvider, providerConfig.default_model, true);
+      } catch (err: unknown) {
+        if (cancelled) return;
+        setModelError(err instanceof Error ? err.message : 'Failed to load provider settings');
+      }
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+      modelRequestRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
 
@@ -147,6 +282,66 @@ export default function AgentChat() {
     }
   };
 
+  const handleProviderChange = async (nextProvider: string) => {
+    setSelectedProvider(nextProvider);
+    setSelectedModel('');
+    setModelOptions([]);
+    setModelCatalog(null);
+    setModelSaved(null);
+    setModelError(null);
+    setModelSearch('');
+    await loadModels(nextProvider, null);
+  };
+
+  const handleModelSelect = (nextModel: string) => {
+    setSelectedModel(nextModel);
+    setModelSaved(null);
+    setModelError(null);
+  };
+
+  const handleModelInput = (nextModel: string) => {
+    setSelectedModel(nextModel);
+    setModelSaved(null);
+    setModelError(null);
+  };
+
+  const handleModelSave = async () => {
+    const provider = selectedProvider.trim();
+    const model = selectedModel.trim();
+    if (!provider || !model) return;
+    setModelSaving(true);
+    setModelError(null);
+    setModelSaved(null);
+    try {
+      await putProviderModelConfig({ provider, model });
+      setModelSaved('Saved. Restart the gateway to apply.');
+      setInitialProvider(provider);
+      setInitialModel(model);
+    } catch (err: unknown) {
+      setModelError(err instanceof Error ? err.message : 'Failed to save selection');
+    } finally {
+      setModelSaving(false);
+    }
+  };
+
+  const handleRestart = async () => {
+    const confirmed = window.confirm(
+      'Restart the gateway now? Active chats will disconnect until it comes back up.',
+    );
+    if (!confirmed) return;
+    setRestarting(true);
+    setRestartError(null);
+    setRestartMessage(null);
+    try {
+      const result = await adminShutdown();
+      setRestartMessage(result.message || 'Gateway shutdown initiated.');
+    } catch (err: unknown) {
+      setRestartError(err instanceof Error ? err.message : 'Failed to restart gateway');
+    } finally {
+      setRestarting(false);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -166,6 +361,49 @@ export default function AgentChat() {
       setTimeout(() => setCopiedId((prev) => (prev === msgId ? null : prev)), 2000);
     });
   }, []);
+
+  useEffect(() => {
+    if (!modelSaved) return;
+    const timer = setTimeout(() => setModelSaved(null), 4000);
+    return () => clearTimeout(timer);
+  }, [modelSaved]);
+
+  useEffect(() => {
+    if (!restartMessage) return;
+    const timer = setTimeout(() => setRestartMessage(null), 4000);
+    return () => clearTimeout(timer);
+  }, [restartMessage]);
+
+  const modelDirty =
+    selectedProvider.trim().length > 0 &&
+    selectedModel.trim().length > 0 &&
+    (selectedProvider.trim() !== initialProvider ||
+      selectedModel.trim() !== initialModel);
+  const renderedModelOptions = ensureModelOption(
+    modelOptions,
+    selectedModel.trim(),
+  );
+  const normalizedModelSearch = modelSearch.trim().toLowerCase();
+  const filteredModelOptions =
+    normalizedModelSearch.length === 0
+      ? renderedModelOptions
+      : renderedModelOptions.filter((model) => {
+          if (model.id === selectedModel.trim()) {
+            return true;
+          }
+          const haystack = `${model.id} ${model.label}`.toLowerCase();
+          return haystack.includes(normalizedModelSearch);
+        });
+  const modelAgeLabel = formatAge(modelCatalog?.source_age_secs);
+  const modelSourceLabel = modelCatalog
+    ? `${modelCatalog.source}${modelAgeLabel ? ` • ${modelAgeLabel} ago` : ''}`
+    : null;
+  const resolvedProviderLabel =
+    modelCatalog &&
+    modelCatalog.effective_provider &&
+    modelCatalog.effective_provider !== modelCatalog.requested_provider
+      ? modelCatalog.effective_provider
+      : null;
 
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
@@ -256,6 +494,123 @@ export default function AgentChat() {
         )}
 
         <div ref={messagesEndRef} />
+      </div>
+
+      {/* Model selector */}
+      <div className="border-t border-gray-800 bg-gray-900/70 px-4 py-3">
+        <div className="flex flex-col gap-3 max-w-4xl mx-auto">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:gap-4">
+            <div className="flex-1 grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1">
+                  Provider
+                </label>
+                <select
+                  value={selectedProvider}
+                  onChange={(e) => handleProviderChange(e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  {providers.length === 0 && (
+                    <option value="">No providers available</option>
+                  )}
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+                {resolvedProviderLabel && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Resolved provider: {resolvedProviderLabel}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1">
+                  Model
+                </label>
+                <input
+                  type="text"
+                  value={modelSearch}
+                  onChange={(e) => setModelSearch(e.target.value)}
+                  placeholder="Search models..."
+                  className="mb-2 w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <select
+                  value={selectedModel}
+                  onChange={(e) => handleModelSelect(e.target.value)}
+                  disabled={loadingModels}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                >
+                  {loadingModels && <option value="">Loading models...</option>}
+                  {!loadingModels && filteredModelOptions.length === 0 && (
+                    <option value="">No models available</option>
+                  )}
+                  {!loadingModels &&
+                    filteredModelOptions.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.label}
+                      </option>
+                    ))}
+                </select>
+                <input
+                  type="text"
+                  value={selectedModel}
+                  onChange={(e) => handleModelInput(e.target.value)}
+                  placeholder="Or enter a custom model id"
+                  className="mt-2 w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                {modelSourceLabel && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Models source: {modelSourceLabel}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 sm:min-w-[180px]">
+              <button
+                onClick={handleModelSave}
+                disabled={!modelDirty || modelSaving}
+                className="flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {modelSaving ? 'Saving...' : 'Save selection'}
+              </button>
+              <button
+                onClick={handleRestart}
+                disabled={restarting}
+                className="flex items-center justify-center gap-2 border border-gray-700 bg-gray-900 text-gray-200 text-sm font-medium px-4 py-2 rounded-lg transition-colors hover:border-gray-600 hover:bg-gray-800 disabled:opacity-50"
+              >
+                {restarting ? 'Restarting...' : 'Restart gateway'}
+              </button>
+            </div>
+          </div>
+
+          {modelSaved && (
+            <div className="rounded-lg bg-green-900/30 border border-green-700 p-2 text-xs text-green-300">
+              {modelSaved}
+            </div>
+          )}
+          {modelError && (
+            <div className="rounded-lg bg-red-900/30 border border-red-700 p-2 text-xs text-red-300">
+              {modelError}
+            </div>
+          )}
+          {restartMessage && (
+            <div className="rounded-lg bg-blue-900/30 border border-blue-700 p-2 text-xs text-blue-300">
+              {restartMessage}
+            </div>
+          )}
+          {restartError && (
+            <div className="rounded-lg bg-red-900/30 border border-red-700 p-2 text-xs text-red-300">
+              {restartError}
+            </div>
+          )}
+          <p className="text-[11px] text-gray-500">
+            Changes update config only. Restart the gateway to apply in the running runtime.
+          </p>
+        </div>
       </div>
 
       {/* Input area */}

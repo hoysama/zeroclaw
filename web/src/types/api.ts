@@ -103,3 +103,39 @@ export interface WsMessage {
   output?: string;
   message?: string;
 }
+
+export type ProviderKind = 'builtin' | 'profile' | 'custom';
+
+export interface ProviderListItem {
+  id: string;
+  label: string;
+  local: boolean;
+  kind: ProviderKind;
+}
+
+export interface ProviderModelOption {
+  id: string;
+  label: string;
+  source: string;
+}
+
+export interface ProviderModelCatalog {
+  requested_provider: string;
+  effective_provider: string;
+  default_model: string;
+  source: string;
+  source_age_secs: number | null;
+  supports_live_fetch: boolean;
+  models: ProviderModelOption[];
+}
+
+export interface ProviderModelConfig {
+  default_provider: string;
+  default_model: string | null;
+  effective_provider: string | null;
+}
+
+export interface ProviderModelUpdate {
+  provider: string;
+  model: string;
+}
